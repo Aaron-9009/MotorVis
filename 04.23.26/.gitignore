@@ -1,0 +1,44 @@
+# ESP-IDF build output
+build/
+
+# Most managed components are regenerated, but these two patched folders are kept
+# because the current Arduino-on-IDF-5.5.4 build depends on the local fixes inside them.
+managed_components/*
+!managed_components/espressif__cbor/
+!managed_components/espressif__cbor/**
+!managed_components/espressif__esp_diagnostics/
+!managed_components/espressif__esp_diagnostics/**
+
+# Local editor and simulation files
+.vscode/
+wokwi/
+
+# Generated or temporary configuration snapshots
+sdkconfig.old
+
+# Optional design docs that are not required to build or flash the firmware
+docs/
+
+# Windows and macOS metadata
+.DS_Store
+
+# PulseSensor vendor extras that are not needed by the ESP-IDF build
+components/PulseSensorPlayground/.clang-format
+components/PulseSensorPlayground/.DS_Store
+components/PulseSensorPlayground/.gitattributes
+components/PulseSensorPlayground/.gitignore
+components/PulseSensorPlayground/README.md
+components/PulseSensorPlayground/keywords.txt
+components/PulseSensorPlayground/library.properties
+components/PulseSensorPlayground/examples/
+components/PulseSensorPlayground/Images/
+components/PulseSensorPlayground/resources/
+
+# TinyGPSPlus vendor extras that are not needed by the ESP-IDF build
+components/TinyGPSPlus-ESPIDF/.gitmodules
+components/TinyGPSPlus-ESPIDF/README.md
+components/TinyGPSPlus-ESPIDF/TinyGPSPlus/README.md
+components/TinyGPSPlus-ESPIDF/TinyGPSPlus/examples/
+components/TinyGPSPlus-ESPIDF/TinyGPSPlus/keywords.txt
+components/TinyGPSPlus-ESPIDF/TinyGPSPlus/library.json
+components/TinyGPSPlus-ESPIDF/TinyGPSPlus/library.properties
