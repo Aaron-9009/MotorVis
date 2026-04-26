@@ -1,4 +1,5 @@
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 
 // C headers are wrapped in extern "C" so this C++ component can call ESP-IDF and FreeRTOS APIs without name-mangling issues.
@@ -28,6 +29,7 @@ static const char *TAG = "GNSS_MANAGER";
 #define MOTOR_VIS_GNSS_TASK_STACK_SIZE      4096
 #define MOTOR_VIS_GNSS_TASK_PRIORITY        5
 #define MOTOR_VIS_GNSS_STATUS_LOG_INTERVAL_MS 5000
+#define MOTOR_VIS_GNSS_NMEA_PREVIEW_LENGTH  96
 
 // --------------------------------------- GNSS SHARED STATE ---------------------------------------
 // TinyGPS++ parser instance now lives inside the GNSS manager instead of a standalone app_main().
@@ -49,6 +51,149 @@ static uint32_t motor_vis_gnss_now_ms(void)
 static int32_t motor_vis_gnss_to_e7(double coordinate)
 {
     return static_cast<int32_t>(llround(coordinate * 10000000.0));
+}
+
+// Small helper copies the latest raw NMEA preview into a stable buffer for periodic diagnostic logs.
+static void motor_vis_gnss_copy_text(char *destination, size_t destination_size, const char *source)
+{
+    if (destination == NULL || destination_size == 0 || source == NULL) {
+        return;
+    }
+
+    std::strncpy(destination, source, destination_size - 1);
+    destination[destination_size - 1] = '\0';
+}
+
+// Captures one printable NMEA sentence preview so GNSS bring-up logs can show what the UART stream looks like.
+static void motor_vis_gnss_capture_sentence_preview(
+    char incoming_char,
+    char *active_sentence,
+    size_t *active_sentence_length,
+    char *latest_sentence,
+    size_t latest_sentence_size
+)
+{
+    if (active_sentence == NULL ||
+        active_sentence_length == NULL ||
+        latest_sentence == NULL ||
+        latest_sentence_size == 0) {
+        return;
+    }
+
+    if (incoming_char == '\r') {
+        return;
+    }
+
+    if (incoming_char == '$') {
+        *active_sentence_length = 0;
+    }
+
+    if (incoming_char == '\n') {
+        if (*active_sentence_length > 0) {
+            active_sentence[*active_sentence_length] = '\0';
+            motor_vis_gnss_copy_text(latest_sentence, latest_sentence_size, active_sentence);
+        }
+        *active_sentence_length = 0;
+        return;
+    }
+
+    if ((unsigned char) incoming_char < 32U || (unsigned char) incoming_char > 126U) {
+        return;
+    }
+
+    if (*active_sentence_length < (MOTOR_VIS_GNSS_NMEA_PREVIEW_LENGTH - 1U)) {
+        active_sentence[*active_sentence_length] = incoming_char;
+        *active_sentence_length += 1U;
+    }
+}
+
+// Formats the parsed UTC time so periodic status logs can show whether the GNSS module is decoding real timing data.
+static void motor_vis_gnss_format_utc_time(char *buffer, size_t buffer_size)
+{
+    if (buffer == NULL || buffer_size == 0) {
+        return;
+    }
+
+    if (s_gps.time.isValid()) {
+        std::snprintf(
+            buffer,
+            buffer_size,
+            "%02u:%02u:%02u",
+            static_cast<unsigned int>(s_gps.time.hour()),
+            static_cast<unsigned int>(s_gps.time.minute()),
+            static_cast<unsigned int>(s_gps.time.second())
+        );
+    } else {
+        motor_vis_gnss_copy_text(buffer, buffer_size, "n/a");
+    }
+}
+
+// Formats HDOP text for logs without forcing the main read task to worry about TinyGPS++ field formatting.
+static void motor_vis_gnss_format_hdop(char *buffer, size_t buffer_size)
+{
+    if (buffer == NULL || buffer_size == 0) {
+        return;
+    }
+
+    if (s_gps.hdop.isValid()) {
+        std::snprintf(buffer, buffer_size, "%.2f", s_gps.hdop.hdop());
+    } else {
+        motor_vis_gnss_copy_text(buffer, buffer_size, "n/a");
+    }
+}
+
+// Periodic parser status log explains whether the module is silent, streaming bad UART data, or still waiting on a sky fix.
+static void motor_vis_gnss_log_parser_status(uint32_t rx_bytes_since_log, const char *latest_sentence)
+{
+    char utc_time_text[16] = {0};
+    char hdop_text[16] = {0};
+    const char *nmea_preview = (latest_sentence != NULL && latest_sentence[0] != '\0') ? latest_sentence : "n/a";
+    uint32_t satellites = s_gps.satellites.isValid() ? s_gps.satellites.value() : 0U;
+
+    motor_vis_gnss_format_utc_time(utc_time_text, sizeof(utc_time_text));
+    motor_vis_gnss_format_hdop(hdop_text, sizeof(hdop_text));
+
+    if (s_gps.passedChecksum() == 0 && s_gps.failedChecksum() > 0) {
+        ESP_LOGW(
+            TAG,
+            "GNSS UART data is arriving but NMEA validation is failing: rx_bytes=%lu chars=%lu passed_checksum=%lu failed_checksum=%lu satellites=%lu hdop=%s utc_time=%s last_nmea=\"%s\". Verify baud rate and signal integrity.",
+            static_cast<unsigned long>(rx_bytes_since_log),
+            static_cast<unsigned long>(s_gps.charsProcessed()),
+            static_cast<unsigned long>(s_gps.passedChecksum()),
+            static_cast<unsigned long>(s_gps.failedChecksum()),
+            static_cast<unsigned long>(satellites),
+            hdop_text,
+            utc_time_text,
+            nmea_preview
+        );
+    } else if (!s_gps.location.isValid()) {
+        ESP_LOGW(
+            TAG,
+            "GNSS is receiving NMEA but a valid fix is not available yet: rx_bytes=%lu chars=%lu passed_checksum=%lu failed_checksum=%lu satellites=%lu hdop=%s utc_time=%s last_nmea=\"%s\". Move the module outdoors with a clear view of the sky if this persists.",
+            static_cast<unsigned long>(rx_bytes_since_log),
+            static_cast<unsigned long>(s_gps.charsProcessed()),
+            static_cast<unsigned long>(s_gps.passedChecksum()),
+            static_cast<unsigned long>(s_gps.failedChecksum()),
+            static_cast<unsigned long>(satellites),
+            hdop_text,
+            utc_time_text,
+            nmea_preview
+        );
+    } else {
+        ESP_LOGI(
+            TAG,
+            "GNSS UART parser status: rx_bytes=%lu chars=%lu passed_checksum=%lu failed_checksum=%lu sentences_with_fix=%lu satellites=%lu hdop=%s utc_time=%s last_nmea=\"%s\"",
+            static_cast<unsigned long>(rx_bytes_since_log),
+            static_cast<unsigned long>(s_gps.charsProcessed()),
+            static_cast<unsigned long>(s_gps.passedChecksum()),
+            static_cast<unsigned long>(s_gps.failedChecksum()),
+            static_cast<unsigned long>(s_gps.sentencesWithFix()),
+            static_cast<unsigned long>(satellites),
+            hdop_text,
+            utc_time_text,
+            nmea_preview
+        );
+    }
 }
 
 // Storage helper so every fix update consistently refreshes timestamp, validity, and sequence.
@@ -89,10 +234,14 @@ static bool motor_vis_gnss_store_fix(bool fix_valid, motor_vis_gnss_fix_t *store
 static void motor_vis_gnss_read_task(void *arg)
 {
     uint8_t data[MOTOR_VIS_GNSS_READ_CHUNK_SIZE];
+    char active_nmea_sentence[MOTOR_VIS_GNSS_NMEA_PREVIEW_LENGTH] = {0};
+    char latest_nmea_sentence[MOTOR_VIS_GNSS_NMEA_PREVIEW_LENGTH] = {0};
+    size_t active_nmea_sentence_length = 0;
     uint32_t bytes_since_status_log = 0;
     uint32_t last_rx_ms = 0;
     uint32_t last_uart_status_log_ms = 0;
     uint32_t last_no_data_log_ms = 0;
+    bool saw_uart_activity = false;
 
     while (true) {
         // Pulls any available NMEA bytes from the GNSS UART without blocking forever if no data is ready yet.
@@ -100,20 +249,18 @@ static void motor_vis_gnss_read_task(void *arg)
         uint32_t now_ms = motor_vis_gnss_now_ms();
 
         if (len > 0) {
+            if (!saw_uart_activity) {
+                // First-byte log confirms that the GPS module is physically reaching the MCU before a valid fix exists.
+                ESP_LOGI(TAG, "GNSS UART activity detected on UART2; NMEA bytes are reaching the ESP32 parser");
+                saw_uart_activity = true;
+            }
+
             last_rx_ms = now_ms;
             bytes_since_status_log += static_cast<uint32_t>(len);
 
             if ((now_ms - last_uart_status_log_ms) >= MOTOR_VIS_GNSS_STATUS_LOG_INTERVAL_MS) {
-                // Periodic UART/parser status confirms the GNSS module is physically sending NMEA data before a fix is available.
-                ESP_LOGI(
-                    TAG,
-                    "GNSS UART parser status: rx_bytes=%lu chars=%lu sentences_with_fix=%lu failed_checksum=%lu location_valid=%u",
-                    static_cast<unsigned long>(bytes_since_status_log),
-                    static_cast<unsigned long>(s_gps.charsProcessed()),
-                    static_cast<unsigned long>(s_gps.sentencesWithFix()),
-                    static_cast<unsigned long>(s_gps.failedChecksum()),
-                    s_gps.location.isValid() ? 1U : 0U
-                );
+                // Periodic parser status now differentiates between silent wiring, checksum trouble, and no-fix-yet field conditions.
+                motor_vis_gnss_log_parser_status(bytes_since_status_log, latest_nmea_sentence);
                 bytes_since_status_log = 0;
                 last_uart_status_log_ms = now_ms;
             }
@@ -122,14 +269,22 @@ static void motor_vis_gnss_read_task(void *arg)
             // No-data logs are meant for hardware bring-up so wiring or baud-rate issues show up in the serial monitor.
             ESP_LOGW(
                 TAG,
-                "GNSS UART has not received data recently; verify GNSS TX -> ESP32 GPIO32, common GND, and 9600 baud"
+                "GNSS UART has not received data recently; verify module power, GNSS TX -> ESP32 GPIO32, common GND, and 9600 baud"
             );
             last_no_data_log_ms = now_ms;
         }
 
         // Feeds each byte into TinyGPS++ so complete NMEA sentences can be assembled across repeated UART reads.
         for (int i = 0; i < len; i++) {
-            s_gps.encode(static_cast<char>(data[i]));
+            char incoming_char = static_cast<char>(data[i]);
+            motor_vis_gnss_capture_sentence_preview(
+                incoming_char,
+                active_nmea_sentence,
+                &active_nmea_sentence_length,
+                latest_nmea_sentence,
+                sizeof(latest_nmea_sentence)
+            );
+            s_gps.encode(incoming_char);
         }
 
         // Only refreshes the shared fix snapshot when TinyGPS++ reports that the decoded location changed.
@@ -157,7 +312,21 @@ static void motor_vis_gnss_read_task(void *arg)
                     static_cast<unsigned long>(stored_fix.sequence)
                 );
             } else {
-                ESP_LOGD(TAG, "GNSS update received but fix is not valid yet");
+                char utc_time_text[16] = {0};
+                char hdop_text[16] = {0};
+                uint32_t satellites = s_gps.satellites.isValid() ? s_gps.satellites.value() : 0U;
+
+                motor_vis_gnss_format_utc_time(utc_time_text, sizeof(utc_time_text));
+                motor_vis_gnss_format_hdop(hdop_text, sizeof(hdop_text));
+
+                ESP_LOGI(
+                    TAG,
+                    "GNSS parser received a location update but the fix is still invalid: satellites=%lu hdop=%s utc_time=%s last_nmea=\"%s\"",
+                    static_cast<unsigned long>(satellites),
+                    hdop_text,
+                    utc_time_text,
+                    latest_nmea_sentence[0] != '\0' ? latest_nmea_sentence : "n/a"
+                );
             }
         }
 
