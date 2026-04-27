@@ -24,5 +24,5 @@
 idf_component_register(
     SRCS "Motor_Vis.c" "motor_vis_ble_uuids.c"
     INCLUDE_DIRS "."
-    REQUIRES bt nvs_flash esp_driver_gpio gnss_manager jacket_controls heart_sensor_manager battery_manager
+    REQUIRES bt nvs_flash esp_driver_gpio gnss_manager jacket_controls heart_sensor_manager battery_manager accelerometer_manager
 )

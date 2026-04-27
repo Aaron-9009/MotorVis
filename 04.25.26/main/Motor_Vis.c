@@ -52,6 +52,8 @@
 #include "battery_manager.h"
 // Includes the heart sensor manager bridge so BLE can pull PulseSensor samples without including Arduino code directly.
 #include "heart_sensor_manager.h"
+// Includes the accelerometer manager bridge so BLE can publish ADXL345 motion data and crash alerts.
+#include "accelerometer_manager.h"
 // Includes the external jacket controls component so button and LED validation stays modular and separate from BLE state logic.
 #include "jacket_controls.h"
 // Includes the shared 128-bit UUID definitions used by the custom MotoVis BLE service and GPS characteristic.
@@ -73,7 +75,7 @@ bool btInUse(void)
 // Maps the active characteristic alias to the GPS characteristic so the GATT event code can target one packet source.
 #define MOTOR_VIS_CHARACTERISTIC_UUID             MOTOR_VIS_CHAR_UUID_GPS
 // Reserves handles for the service plus the GPS, heart-rate, and battery characteristic/value/user-description/CCCD groups.
-#define MOTOR_VIS_NUM_HANDLES                      13
+#define MOTOR_VIS_NUM_HANDLES                      17
 #define MOTOR_VIS_DEVICE_NAME                      "MotoVis Jacket"
 // TODO: Testing Code
 // #define MOTOR_VIS_MAX_VALUE_LENGTH             64
@@ -93,6 +95,8 @@ static const char *TAG = "MOTOR_VIS_BLE";
 static const char *TAG_HEART = "MOTOR_VIS_HEART";
 // Separate battery-data tag keeps voltage and percentage logs easy to spot during power testing.
 static const char *TAG_BATTERY = "MOTOR_VIS_BATTERY";
+// Separate accelerometer tag keeps motion and crash alert logs easy to spot during sensor bring-up.
+static const char *TAG_ACCEL = "MOTOR_VIS_ACCEL";
 // TODO: Testing Code
 // static const uint8_t MOTOR_VIS_SERVICE_UUID[16] = {
 //     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
@@ -121,6 +125,9 @@ typedef enum {
     MOTOR_VIS_GATT_BUILD_BATTERY_CHARACTERISTIC,
     MOTOR_VIS_GATT_BUILD_BATTERY_USER_DESCRIPTION,
     MOTOR_VIS_GATT_BUILD_BATTERY_CCCD,
+    MOTOR_VIS_GATT_BUILD_ACCEL_CHARACTERISTIC,
+    MOTOR_VIS_GATT_BUILD_ACCEL_USER_DESCRIPTION,
+    MOTOR_VIS_GATT_BUILD_ACCEL_CCCD,
     MOTOR_VIS_GATT_BUILD_COMPLETE,
 } motor_vis_gatt_build_state_t;
 
@@ -150,6 +157,15 @@ typedef struct __attribute__((packed)) {
     uint8_t battery_valid;
 } motor_vis_battery_payload_t;
 
+// Fixed-format BLE accelerometer payload: signed milli-g values for each axis plus a crash alert flag.
+typedef struct __attribute__((packed)) {
+    uint32_t timestamp_ms;
+    int16_t  ax_mg;
+    int16_t  ay_mg;
+    int16_t  az_mg;
+    uint8_t  alert;
+} motor_vis_accel_payload_t;
+
 typedef struct __attribute__((packed)) {} motor_vis_placeholder_payload_t;
 
 //-----------------------------------------------------------------------------------------------------------
@@ -160,6 +176,7 @@ typedef struct __attribute__((packed)) {} motor_vis_placeholder_payload_t;
 #define MOTOR_VIS_GPS_PAYLOAD_LENGTH ((uint16_t) sizeof(motor_vis_gps_payload_t))
 #define MOTOR_VIS_HEART_RATE_PAYLOAD_LENGTH ((uint16_t) sizeof(motor_vis_heart_rate_payload_t))
 #define MOTOR_VIS_BATTERY_PAYLOAD_LENGTH ((uint16_t) sizeof(motor_vis_battery_payload_t))
+#define MOTOR_VIS_ACCEL_PAYLOAD_LENGTH   ((uint16_t) sizeof(motor_vis_accel_payload_t))
 #define MOTOR_VIS_PLACEHOLDER_PAYLOAD_LENGTH ((uint16_t) sizeof(motor_vis_placeholder_payload_t));
 //-----------------------------------------------------------------------------------------------------------
 
@@ -184,6 +201,10 @@ static uint16_t motor_vis_heart_cccd_handle = 0;
 static uint16_t motor_vis_battery_characteristic_handle = 0;
 static uint16_t motor_vis_battery_user_description_handle = 0;
 static uint16_t motor_vis_battery_cccd_handle = 0;
+// Tracks the accelerometer characteristic and descriptor handles so motion samples can be pushed to connected clients.
+static uint16_t motor_vis_accel_characteristic_handle = 0;
+static uint16_t motor_vis_accel_user_description_handle = 0;
+static uint16_t motor_vis_accel_cccd_handle = 0;
 static esp_gatt_if_t motor_vis_gatts_if = ESP_GATT_IF_NONE;
 static uint16_t motor_vis_connection_id = 0;
 static bool motor_vis_connected = false;
@@ -197,6 +218,8 @@ static bool motor_vis_gps_notifications_enabled = false;
 static bool motor_vis_heart_notifications_enabled = false;
 // Tracks whether the current BLE client enabled notifications on the battery characteristic.
 static bool motor_vis_battery_notifications_enabled = false;
+// Tracks whether the current BLE client enabled notifications on the accelerometer characteristic.
+static bool motor_vis_accel_notifications_enabled = false;
 // Tracks whether the jacket controls component initialized successfully so shared BLE callbacks can safely drive the external LEDs.
 static bool motor_vis_jacket_controls_ready = false;
 // Remembers the most recent GNSS sequence that has already been published into the BLE attribute database.
@@ -205,6 +228,8 @@ static uint32_t motor_vis_last_published_gnss_sequence = 0;
 static uint32_t motor_vis_last_published_heart_sequence = 0;
 // Remembers the most recent battery sequence that has already been published into the BLE attribute database.
 static uint32_t motor_vis_last_published_battery_sequence = 0;
+// Remembers the most recent accelerometer sequence that has already been published into the BLE attribute database.
+static uint32_t motor_vis_last_published_accel_sequence = 0;
 // Tracks which GATT attribute is currently being added while ESP-IDF reports asynchronous add events.
 static motor_vis_gatt_build_state_t motor_vis_gatt_build_state = MOTOR_VIS_GATT_BUILD_IDLE;
 // Tracks whether a crash/alert event is still inside the cancellable window before the companion app alert is sent.
@@ -242,6 +267,12 @@ static uint8_t motor_vis_battery_characteristic_value[MOTOR_VIS_BATTERY_PAYLOAD_
 static uint8_t motor_vis_battery_user_description_value[] = "MotoVis Battery Packet";
 // Stores the battery CCCD value separately so power telemetry notifications can be enabled independently.
 static uint8_t motor_vis_battery_cccd_value[MOTOR_VIS_CLIENT_CONFIG_LENGTH] = {0};
+// Initializes the accelerometer characteristic with zeroed data so BLE remains readable before the first ADXL345 sample arrives.
+static uint8_t motor_vis_accel_characteristic_value[MOTOR_VIS_ACCEL_PAYLOAD_LENGTH] = {0};
+// Stores the human-readable accelerometer descriptor string that LightBlue can display beside the packet characteristic.
+static uint8_t motor_vis_accel_user_description_value[] = "MotoVis Accel Packet";
+// Stores the accelerometer CCCD value separately so motion telemetry notifications can be enabled independently.
+static uint8_t motor_vis_accel_cccd_value[MOTOR_VIS_CLIENT_CONFIG_LENGTH] = {0};
 
 // Attribute metadata for the GPS characteristic's fixed-size packet payload.
 static esp_attr_value_t motor_vis_gps_attribute_value = {
@@ -304,6 +335,27 @@ static esp_attr_value_t motor_vis_battery_cccd_attribute_value = {
     .attr_max_len = MOTOR_VIS_CLIENT_CONFIG_LENGTH,
     .attr_len = MOTOR_VIS_CLIENT_CONFIG_LENGTH,
     .attr_value = motor_vis_battery_cccd_value,
+};
+
+// Attribute metadata for the accelerometer characteristic's fixed-size packet payload.
+static esp_attr_value_t motor_vis_accel_attribute_value = {
+    .attr_max_len = MOTOR_VIS_ACCEL_PAYLOAD_LENGTH,
+    .attr_len = MOTOR_VIS_ACCEL_PAYLOAD_LENGTH,
+    .attr_value = motor_vis_accel_characteristic_value,
+};
+
+// Attribute metadata for the standard Characteristic User Description descriptor that provides a friendly accelerometer label.
+static esp_attr_value_t motor_vis_accel_user_description_attribute_value = {
+    .attr_max_len = sizeof(motor_vis_accel_user_description_value) - 1,
+    .attr_len = sizeof(motor_vis_accel_user_description_value) - 1,
+    .attr_value = motor_vis_accel_user_description_value,
+};
+
+// Attribute metadata for the accelerometer Client Characteristic Configuration Descriptor (CCCD).
+static esp_attr_value_t motor_vis_accel_cccd_attribute_value = {
+    .attr_max_len = MOTOR_VIS_CLIENT_CONFIG_LENGTH,
+    .attr_len = MOTOR_VIS_CLIENT_CONFIG_LENGTH,
+    .attr_value = motor_vis_accel_cccd_value,
 };
 
 // --------------------------------------- BLE ADVERTISING CONFIGURATION ---------------------------------------
@@ -379,6 +431,8 @@ static void motor_vis_reset_gps_cccd_state(void);
 static void motor_vis_reset_heart_cccd_state(void);
 // Resets the battery CCCD state whenever a new connection lifecycle begins.
 static void motor_vis_reset_battery_cccd_state(void);
+// Resets the accelerometer CCCD state whenever a new connection lifecycle begins.
+static void motor_vis_reset_accel_cccd_state(void);
 // Resets every notification subscription flag so reconnects always start from a known state.
 static void motor_vis_reset_all_cccd_state(void);
 // Builds a known invalid GPS payload so BLE remains readable before GNSS has a valid fix.
@@ -393,18 +447,26 @@ static esp_err_t motor_vis_publish_gps_payload(const motor_vis_gps_payload_t *pa
 static esp_err_t motor_vis_publish_heart_payload(const motor_vis_heart_rate_payload_t *payload, bool notify_client);
 // Writes the battery payload into the BLE attribute database and optionally notifies subscribed clients.
 static esp_err_t motor_vis_publish_battery_payload(const motor_vis_battery_payload_t *payload, bool notify_client);
+// Writes the accelerometer payload into the BLE attribute database and optionally notifies subscribed clients.
+static esp_err_t motor_vis_publish_accel_payload(const motor_vis_accel_payload_t *payload, bool notify_client);
 // Logs the exact GPS characteristic packet layout so firmware bring-up matches what the Android app will decode.
 static void motor_vis_log_gps_characteristic_packet(const motor_vis_gps_payload_t *payload, bool notify_client);
 // Logs the exact heart characteristic packet layout so firmware bring-up matches what the Android app will decode.
 static void motor_vis_log_heart_characteristic_packet(const motor_vis_heart_rate_payload_t *payload, bool notify_client);
 // Logs the exact battery characteristic packet layout so firmware bring-up matches what the Android app will decode.
 static void motor_vis_log_battery_characteristic_packet(const motor_vis_battery_payload_t *payload, bool notify_client);
+// Logs the exact accelerometer characteristic packet layout so firmware bring-up matches what the Android app will decode.
+static void motor_vis_log_accel_characteristic_packet(const motor_vis_accel_payload_t *payload, bool notify_client);
 // Converts the shared GNSS manager struct into the BLE GPS packet format.
 static esp_err_t motor_vis_publish_gnss_fix(const motor_vis_gnss_fix_t *fix, bool notify_client);
 // Converts the shared heart manager struct into the BLE heart-rate packet format.
 static esp_err_t motor_vis_publish_heart_sample(const motor_vis_heart_sample_t *sample, bool notify_client);
 // Converts the shared battery manager struct into the BLE battery packet format.
 static esp_err_t motor_vis_publish_battery_sample(const motor_vis_battery_sample_t *sample, bool notify_client);
+// Converts the shared accelerometer manager struct into the BLE accelerometer packet format.
+static esp_err_t motor_vis_publish_accel_sample(const motor_vis_accel_sample_t *sample, bool notify_client);
+// Logs each newly captured accelerometer sample in plain English for terminal monitoring.
+static void motor_vis_log_live_accel_sample(const motor_vis_accel_sample_t *sample);
 // Adds the next GATT characteristic or descriptor while the custom service is being constructed.
 static void motor_vis_add_gps_characteristic(void);
 static void motor_vis_add_gps_user_description(void);
@@ -415,6 +477,9 @@ static void motor_vis_add_heart_cccd(void);
 static void motor_vis_add_battery_characteristic(void);
 static void motor_vis_add_battery_user_description(void);
 static void motor_vis_add_battery_cccd(void);
+static void motor_vis_add_accel_characteristic(void);
+static void motor_vis_add_accel_user_description(void);
+static void motor_vis_add_accel_cccd(void);
 
 //-------------------------------------------------------------------------------------------------------------------------
 
@@ -660,12 +725,31 @@ static void motor_vis_reset_battery_cccd_state(void)
     }
 }
 
+// Rebuilds the accelerometer CCCD state so motion notifications default to disabled on every new connection.
+static void motor_vis_reset_accel_cccd_state(void)
+{
+    memset(motor_vis_accel_cccd_value, 0, sizeof(motor_vis_accel_cccd_value));
+    motor_vis_accel_notifications_enabled = false;
+
+    if (motor_vis_accel_cccd_handle != 0) {
+        esp_err_t err = esp_ble_gatts_set_attr_value(
+            motor_vis_accel_cccd_handle,
+            sizeof(motor_vis_accel_cccd_value),
+            motor_vis_accel_cccd_value
+        );
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "failed to reset accel CCCD state: %s", esp_err_to_name(err));
+        }
+    }
+}
+
 // Resets all CCCD state together so the connection lifecycle cannot accidentally leave one stream subscribed.
 static void motor_vis_reset_all_cccd_state(void)
 {
     motor_vis_reset_gps_cccd_state();
     motor_vis_reset_heart_cccd_state();
     motor_vis_reset_battery_cccd_state();
+    motor_vis_reset_accel_cccd_state();
 }
 
 // Creates a consistent invalid GPS payload that the Android app can treat as "no fix available yet".
@@ -687,6 +771,13 @@ static void motor_vis_copy_invalid_battery_payload(motor_vis_battery_payload_t *
 {
     memset(payload, 0, sizeof(*payload));
     payload->battery_valid = 0;
+}
+
+// Creates a zeroed accelerometer payload so BLE remains readable before the first ADXL345 sample arrives.
+static void motor_vis_copy_invalid_accel_payload(motor_vis_accel_payload_t *payload)
+{
+    memset(payload, 0, sizeof(*payload));
+    payload->alert = 0;
 }
 
 // Logs the same packed field order that is stored in the GPS characteristic value.
@@ -806,6 +897,46 @@ static void motor_vis_log_battery_characteristic_packet(const motor_vis_battery_
         (unsigned int) packet_bytes[8],
         (unsigned int) packet_bytes[9]
     );
+}
+
+// Logs the same packed field order that is stored in the accelerometer characteristic value.
+static void motor_vis_log_accel_characteristic_packet(const motor_vis_accel_payload_t *payload, bool notify_client)
+{
+    const uint8_t *packet_bytes = (const uint8_t *) payload;
+
+    ESP_LOGI(
+        TAG_ACCEL,
+        "ACCEL GATT packet fields: timestamp_ms=%lu ax_mg=%d ay_mg=%d az_mg=%d alert=%u payload_len=%u notify_requested=%u notifications_enabled=%u",
+        (unsigned long) payload->timestamp_ms,
+        (int) payload->ax_mg,
+        (int) payload->ay_mg,
+        (int) payload->az_mg,
+        (unsigned int) payload->alert,
+        (unsigned int) MOTOR_VIS_ACCEL_PAYLOAD_LENGTH,
+        notify_client ? 1U : 0U,
+        motor_vis_accel_notifications_enabled ? 1U : 0U
+    );
+
+    ESP_LOGI(
+        TAG_ACCEL,
+        "ACCEL GATT packet bytes: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+        (unsigned int) packet_bytes[0],
+        (unsigned int) packet_bytes[1],
+        (unsigned int) packet_bytes[2],
+        (unsigned int) packet_bytes[3],
+        (unsigned int) packet_bytes[4],
+        (unsigned int) packet_bytes[5],
+        (unsigned int) packet_bytes[6],
+        (unsigned int) packet_bytes[7],
+        (unsigned int) packet_bytes[8],
+        (unsigned int) packet_bytes[9],
+        (unsigned int) packet_bytes[10]
+    );
+
+    if (payload->alert) {
+        ESP_LOGW(TAG_ACCEL, "crash alert set in accelerometer packet: ax=%d ay=%d az=%d mg",
+                 (int) payload->ax_mg, (int) payload->ay_mg, (int) payload->az_mg);
+    }
 }
 
 // Logs each newly captured heart sample in plain English so teammates can watch live pulse updates in the terminal
@@ -1000,6 +1131,84 @@ static esp_err_t motor_vis_publish_battery_sample(const motor_vis_battery_sample
     }
 
     return motor_vis_publish_battery_payload(&payload, notify_client);
+}
+
+// Centralizes attribute updates and notification sending for the accelerometer characteristic.
+static esp_err_t motor_vis_publish_accel_payload(const motor_vis_accel_payload_t *payload, bool notify_client)
+{
+    memcpy(motor_vis_accel_characteristic_value, payload, sizeof(*payload));
+
+    if (motor_vis_accel_characteristic_handle == 0) {
+        // Allows the buffer to be primed before the BLE attribute handle exists.
+        return ESP_OK;
+    }
+
+    esp_err_t err = esp_ble_gatts_set_attr_value(
+        motor_vis_accel_characteristic_handle,
+        MOTOR_VIS_ACCEL_PAYLOAD_LENGTH,
+        motor_vis_accel_characteristic_value
+    );
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    motor_vis_log_accel_characteristic_packet(payload, notify_client);
+
+    if (notify_client &&
+        motor_vis_connected &&
+        motor_vis_accel_notifications_enabled &&
+        motor_vis_gatts_if != ESP_GATT_IF_NONE) {
+        err = esp_ble_gatts_send_indicate(
+            motor_vis_gatts_if,
+            motor_vis_connection_id,
+            motor_vis_accel_characteristic_handle,
+            MOTOR_VIS_ACCEL_PAYLOAD_LENGTH,
+            motor_vis_accel_characteristic_value,
+            false
+        );
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+
+    return ESP_OK;
+}
+
+// Logs each newly captured accelerometer sample so terminal output reflects live motion data.
+static void motor_vis_log_live_accel_sample(const motor_vis_accel_sample_t *sample)
+{
+    if (sample == NULL) {
+        return;
+    }
+
+    ESP_LOGI(
+        TAG_ACCEL,
+        "live accel sample: seq=%lu timestamp_ms=%lu ax=%d ay=%d az=%d mg alert=%u",
+        (unsigned long) sample->sequence,
+        (unsigned long) sample->timestamp_ms,
+        (int) sample->ax_mg,
+        (int) sample->ay_mg,
+        (int) sample->az_mg,
+        (unsigned int) sample->alert
+    );
+}
+
+// Translates the accelerometer manager sample into the custom BLE payload.
+static esp_err_t motor_vis_publish_accel_sample(const motor_vis_accel_sample_t *sample, bool notify_client)
+{
+    motor_vis_accel_payload_t payload;
+
+    if (sample == NULL) {
+        motor_vis_copy_invalid_accel_payload(&payload);
+    } else {
+        payload.timestamp_ms = sample->timestamp_ms;
+        payload.ax_mg        = sample->ax_mg;
+        payload.ay_mg        = sample->ay_mg;
+        payload.az_mg        = sample->az_mg;
+        payload.alert        = sample->alert;
+    }
+
+    return motor_vis_publish_accel_payload(&payload, notify_client);
 }
 
 // Function to apply RGB color to the status LED.
@@ -1357,6 +1566,77 @@ static void motor_vis_add_battery_cccd(void)
     }
 }
 
+// Adds the accelerometer characteristic using the reserved MotoVis UUID so the app can read and subscribe to motion data.
+static void motor_vis_add_accel_characteristic(void)
+{
+    esp_bt_uuid_t characteristic_uuid = {0};
+    motor_vis_uuid128_to_esp_bt_uuid(MOTOR_VIS_CHAR_UUID_ACCELEROMETER, &characteristic_uuid);
+
+    esp_gatt_char_prop_t properties = ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_NOTIFY;
+
+    motor_vis_gatt_build_state = MOTOR_VIS_GATT_BUILD_ACCEL_CHARACTERISTIC;
+
+    esp_err_t err = esp_ble_gatts_add_char(
+        motor_vis_service_handle,
+        &characteristic_uuid,
+        ESP_GATT_PERM_READ,
+        properties,
+        &motor_vis_accel_attribute_value,
+        NULL
+    );
+    if (err != ESP_OK) {
+        motor_vis_report_error("add accel characteristic", err);
+    }
+}
+
+// Adds the standard user-description descriptor so generic BLE browser apps can label the accelerometer characteristic.
+static void motor_vis_add_accel_user_description(void)
+{
+    esp_bt_uuid_t descriptor_uuid = {
+        .len = ESP_UUID_LEN_16,
+        .uuid = {
+            .uuid16 = MOTOR_VIS_USER_DESCRIPTION_DESCRIPTOR_UUID,
+        },
+    };
+
+    motor_vis_gatt_build_state = MOTOR_VIS_GATT_BUILD_ACCEL_USER_DESCRIPTION;
+
+    esp_err_t err = esp_ble_gatts_add_char_descr(
+        motor_vis_service_handle,
+        &descriptor_uuid,
+        ESP_GATT_PERM_READ,
+        &motor_vis_accel_user_description_attribute_value,
+        NULL
+    );
+    if (err != ESP_OK) {
+        motor_vis_report_error("add accel user description", err);
+    }
+}
+
+// Adds the accelerometer CCCD so clients can independently enable motion telemetry notifications.
+static void motor_vis_add_accel_cccd(void)
+{
+    esp_bt_uuid_t descriptor_uuid = {
+        .len = ESP_UUID_LEN_16,
+        .uuid = {
+            .uuid16 = MOTOR_VIS_CLIENT_CONFIG_DESCRIPTOR_UUID,
+        },
+    };
+
+    motor_vis_gatt_build_state = MOTOR_VIS_GATT_BUILD_ACCEL_CCCD;
+
+    esp_err_t err = esp_ble_gatts_add_char_descr(
+        motor_vis_service_handle,
+        &descriptor_uuid,
+        ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
+        &motor_vis_accel_cccd_attribute_value,
+        NULL
+    );
+    if (err != ESP_OK) {
+        motor_vis_report_error("add accel CCCD", err);
+    }
+}
+
 // Handler for GATT read events, sends the current characteristic or descriptor value back to the client.
 static void handle_read_event(
     esp_gatt_if_t gatts_if,
@@ -1440,6 +1720,30 @@ static void handle_read_event(
             response.attr_value.value,
             motor_vis_battery_cccd_value,
             sizeof(motor_vis_battery_cccd_value)
+        );
+    } else if (param->read.handle == motor_vis_accel_characteristic_handle) {
+        // Accelerometer reads return the latest fixed-format milli-g payload.
+        response.attr_value.len = MOTOR_VIS_ACCEL_PAYLOAD_LENGTH;
+        memcpy(
+            response.attr_value.value,
+            motor_vis_accel_characteristic_value,
+            MOTOR_VIS_ACCEL_PAYLOAD_LENGTH
+        );
+    } else if (param->read.handle == motor_vis_accel_user_description_handle) {
+        // Exposes the standard user-description text so LightBlue and similar tools can label the accel stream.
+        response.attr_value.len = sizeof(motor_vis_accel_user_description_value) - 1;
+        memcpy(
+            response.attr_value.value,
+            motor_vis_accel_user_description_value,
+            sizeof(motor_vis_accel_user_description_value) - 1
+        );
+    } else if (param->read.handle == motor_vis_accel_cccd_handle) {
+        // Exposes the accelerometer CCCD state so clients can inspect motion notification subscriptions independently.
+        response.attr_value.len = sizeof(motor_vis_accel_cccd_value);
+        memcpy(
+            response.attr_value.value,
+            motor_vis_accel_cccd_value,
+            sizeof(motor_vis_accel_cccd_value)
         );
     } else {
         status = ESP_GATT_NOT_FOUND;
@@ -1595,6 +1899,39 @@ static void handle_write_event(
                         TAG,
                         "battery notifications %s",
                         motor_vis_battery_notifications_enabled ? "enabled" : "disabled"
+                    );
+                }
+            } else {
+                status = ESP_GATT_REQ_NOT_SUPPORTED;
+            }
+        }
+    } else if (param->write.handle == motor_vis_accel_cccd_handle) {
+        // Accelerometer CCCD writes are handled separately so the app can subscribe to motion data independently.
+        if (param->write.len != MOTOR_VIS_CLIENT_CONFIG_LENGTH) {
+            status = ESP_GATT_INVALID_ATTR_LEN;
+        } else {
+            uint16_t client_config_value =
+                (uint16_t) param->write.value[0] |
+                ((uint16_t) param->write.value[1] << 8);
+
+            if (client_config_value == 0x0000 || client_config_value == 0x0001) {
+                motor_vis_accel_cccd_value[0] = param->write.value[0];
+                motor_vis_accel_cccd_value[1] = param->write.value[1];
+                motor_vis_accel_notifications_enabled = (client_config_value == 0x0001);
+
+                esp_err_t err = esp_ble_gatts_set_attr_value(
+                    motor_vis_accel_cccd_handle,
+                    sizeof(motor_vis_accel_cccd_value),
+                    motor_vis_accel_cccd_value
+                );
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "failed to update accel CCCD: %s", esp_err_to_name(err));
+                    status = ESP_GATT_ERROR;
+                } else {
+                    ESP_LOGI(
+                        TAG_ACCEL,
+                        "accel notifications %s",
+                        motor_vis_accel_notifications_enabled ? "enabled" : "disabled"
                     );
                 }
             } else {
@@ -1788,6 +2125,18 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
 
             // Adds the standard user-description descriptor before the CCCD so browser apps can display a friendly label.
             motor_vis_add_battery_user_description();
+        } else if (motor_vis_gatt_build_state == MOTOR_VIS_GATT_BUILD_ACCEL_CHARACTERISTIC) {
+            // Remembers the accelerometer characteristic handle so ADXL345 samples can be pushed into the BLE attribute database.
+            motor_vis_accel_characteristic_handle = param->add_char.attr_handle;
+            ESP_LOGI(TAG, "accel characteristic added, handle=%d", motor_vis_accel_characteristic_handle);
+
+            // Primes the newly created characteristic with a zeroed payload until the first ADXL345 sample arrives.
+            err = motor_vis_publish_accel_sample(NULL, false);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "failed to prime accel characteristic: %s", esp_err_to_name(err));
+            }
+
+            motor_vis_add_accel_user_description();
         } else {
             ESP_LOGW(TAG, "unexpected characteristic added while GATT build state=%d", motor_vis_gatt_build_state);
         }
@@ -1831,6 +2180,19 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
             motor_vis_battery_cccd_handle = param->add_char_descr.attr_handle;
             ESP_LOGI(TAG, "battery CCCD added, handle=%d", motor_vis_battery_cccd_handle);
             motor_vis_reset_battery_cccd_state();
+
+            // Continue building the service by adding the accelerometer characteristic after the battery group is complete.
+            motor_vis_add_accel_characteristic();
+        } else if (motor_vis_gatt_build_state == MOTOR_VIS_GATT_BUILD_ACCEL_USER_DESCRIPTION) {
+            // Remembers the accel user-description handle so manual read responses can expose the friendly label text.
+            motor_vis_accel_user_description_handle = param->add_char_descr.attr_handle;
+            ESP_LOGI(TAG, "accel user description added, handle=%d", motor_vis_accel_user_description_handle);
+            motor_vis_add_accel_cccd();
+        } else if (motor_vis_gatt_build_state == MOTOR_VIS_GATT_BUILD_ACCEL_CCCD) {
+            // Remember the accel CCCD handle so BLE writes can toggle motion notification state correctly.
+            motor_vis_accel_cccd_handle = param->add_char_descr.attr_handle;
+            ESP_LOGI(TAG, "accel CCCD added, handle=%d", motor_vis_accel_cccd_handle);
+            motor_vis_reset_accel_cccd_state();
             motor_vis_gatt_build_state = MOTOR_VIS_GATT_BUILD_COMPLETE;
             ESP_LOGI(TAG, "MotoVis GATT database build complete");
         } else {
@@ -1964,6 +2326,8 @@ void app_main(void)
     bool heart_sensor_ready = false;
     // Tracks whether the battery manager initialized cleanly so the main loop only publishes voltage samples when ready.
     bool battery_manager_ready = false;
+    // Tracks whether the accelerometer manager initialized cleanly so the main loop only publishes motion samples when ready.
+    bool accel_manager_ready = false;
     // TODO: Testing Code
     // bool alert_test_led_enabled = false;
     // Previous alert button validation toggled the alert LED directly before a cancellable alert state existed.
@@ -2070,6 +2434,20 @@ void app_main(void)
     } else {
         heart_sensor_ready = true;
         ESP_LOGI(TAG, "heart sensor manager initialized successfully");
+    }
+
+    // Initializes the accelerometer manager before BLE starts so the accel characteristic can be primed immediately.
+    err = motor_vis_accel_manager_init();
+    if (err != ESP_OK) {
+        // Accelerometer startup is non-fatal so the rest of the system can run without motion data.
+        ESP_LOGE(TAG, "accelerometer manager init failed, continuing BLE without motion data: %s", esp_err_to_name(err));
+        err = motor_vis_publish_accel_sample(NULL, false);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "failed to prime zeroed accel payload after accel init failure: %s", esp_err_to_name(err));
+        }
+    } else {
+        accel_manager_ready = true;
+        ESP_LOGI(TAG, "accelerometer manager initialized successfully");
     }
 
     // Initialize Bluetooth controller with default configuration.
@@ -2213,6 +2591,32 @@ void app_main(void)
                         (unsigned int) latest_battery_sample.voltage_mv,
                         (unsigned int) latest_battery_sample.percentage,
                         (unsigned int) latest_battery_sample.raw_adc
+                    );
+                }
+            }
+        }
+
+        // Pulls the latest accelerometer sample and publishes every new sequence so the app receives continuous motion data.
+        if (accel_manager_ready) {
+            motor_vis_accel_sample_t latest_accel_sample = {0};
+
+            if (motor_vis_accel_manager_get_latest_sample(&latest_accel_sample) &&
+                latest_accel_sample.sequence > motor_vis_last_published_accel_sequence) {
+                motor_vis_log_live_accel_sample(&latest_accel_sample);
+
+                err = motor_vis_publish_accel_sample(&latest_accel_sample, true);
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "failed to publish accel characteristic update: %s", esp_err_to_name(err));
+                } else {
+                    motor_vis_last_published_accel_sequence = latest_accel_sample.sequence;
+                    ESP_LOGI(
+                        TAG_ACCEL,
+                        "published accel update seq=%lu ax=%d ay=%d az=%d mg alert=%u",
+                        (unsigned long) latest_accel_sample.sequence,
+                        (int) latest_accel_sample.ax_mg,
+                        (int) latest_accel_sample.ay_mg,
+                        (int) latest_accel_sample.az_mg,
+                        (unsigned int) latest_accel_sample.alert
                     );
                 }
             }
