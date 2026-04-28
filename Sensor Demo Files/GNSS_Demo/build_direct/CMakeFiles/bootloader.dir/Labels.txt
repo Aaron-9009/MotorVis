@@ -1,0 +1,13 @@
+# Target labels
+ bootloader
+# Source files and their labels
+C:/Users/aaron/Desktop/GNSS_Demo/build_direct/CMakeFiles/bootloader
+C:/Users/aaron/Desktop/GNSS_Demo/build_direct/CMakeFiles/bootloader.rule
+C:/Users/aaron/Desktop/GNSS_Demo/build_direct/CMakeFiles/bootloader-complete.rule
+C:/Users/aaron/Desktop/GNSS_Demo/build_direct/bootloader-prefix/src/bootloader-stamp/bootloader-build.rule
+C:/Users/aaron/Desktop/GNSS_Demo/build_direct/bootloader-prefix/src/bootloader-stamp/bootloader-configure.rule
+C:/Users/aaron/Desktop/GNSS_Demo/build_direct/bootloader-prefix/src/bootloader-stamp/bootloader-download.rule
+C:/Users/aaron/Desktop/GNSS_Demo/build_direct/bootloader-prefix/src/bootloader-stamp/bootloader-install.rule
+C:/Users/aaron/Desktop/GNSS_Demo/build_direct/bootloader-prefix/src/bootloader-stamp/bootloader-mkdir.rule
+C:/Users/aaron/Desktop/GNSS_Demo/build_direct/bootloader-prefix/src/bootloader-stamp/bootloader-patch.rule
+C:/Users/aaron/Desktop/GNSS_Demo/build_direct/bootloader-prefix/src/bootloader-stamp/bootloader-update.rule

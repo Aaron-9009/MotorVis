@@ -1,0 +1,9 @@
+
+
+# Load bootloader symbols
+set confirm off
+    add-symbol-file C:/Users/aaron/Desktop/GNSS_Demo/build_direct/bootloader/bootloader.elf
+set confirm on
+
+# Load application symbols
+file C:/Users/aaron/Desktop/GNSS_Demo/build_direct/GNSS_Demo.elf

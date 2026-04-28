@@ -1,0 +1,9 @@
+
+
+# Load bootloader symbols
+set confirm off
+    add-symbol-file C:/Users/aaron/Desktop/Accel_Demo/build/bootloader/bootloader.elf
+set confirm on
+
+# Load application symbols
+file C:/Users/aaron/Desktop/Accel_Demo/build/Accel_Demo.elf
