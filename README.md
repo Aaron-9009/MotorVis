@@ -1,54 +1,42 @@
-# MotorVis Files
-Adafruit ESP32 Feather V2 Microcontroller (MC) files for MotorVis product
+# MotoVis Jacket Capstone Project
+**Undergraduate Capstone Final Project**
+*<br> University of Southern California | 2026*
 
-## IDE Setup
-I used the following when coding the files used for the MC:
-- Visual Studio Code
-- ESP-IDF Extension
+### Team Members
 
-NOTE: It was lowk a pain to get the IDE set up and working properly with the microcontoller...
+>**Aaron Gonzalez**
+ *<br> B.S. Electrical and Computer Engineering*
 
-## Status on Current Firmware
-# Android App
-1. Gave up on the smooth mechanics for the Jacket render, will try and get it working after I get the logic for the important stuff established
-2. 
+>**Will Bradley**
+ *<br> B.S. Electrical and Computer Engineering*
 
-# MC Firmware
-1. Getting the BLE service to connect to the app.
-2. Getting a unique identification so that the application can recognize the MC as the smart jacket. 
+>**Pela Karamalonis**
+ *<br> B.S. Electrical and Computer Engineering*
 
-## BLE Structure / Ops.
-I am still working on getting the data to send smoothly from the MC to the App but I was able to integrate the GNSS data into the GATT Server that I had made. I wrote my portion in C (mainly cause I had previously worked with C in making a GATT Server lol) but I got the 
-C++ firmware for the GPS working. Here is an outline of how it is currently working but I will be updating it as I implement the rest of the sensors and data handling. 
+**Note** <br>
+In collaboration with: <br>
+>**Lily Nguyen-Wilson**
+ <br>  *Otis College of Art and Design | B.S. Electrical and Computer Engineering*
 
-# GATT Outline:
-1. BLE Stack Init:
-- Initalizes the MC in BLE-only mode and enables the Blueroid stack for GATT ops. It then registers registers GAP event handlers and GATT event handlers. I also named the MC "MotorVis Jacket" as a temp name but we can easily just change this when we finalize the name we want or we can even estbalish some sort of custom naming like:
-- "[name] Jacket"
-2. Advertising Setup: 
-- The MC is advertised as a BLE perph publicly as with the establisehd name but includes:
-1. 128-bit service UUID
-2. Non-connectable Advertising parameters w/ 20-40ms intervals. 
+as designer and producer of physical MotorVis Jacket. 
 
-3. GATT Service Struct
-- Single Primary Service 
-- GPS Charactersitic:
-    - 128 UUID
-    - Read / Notify Properties
-   w/ descriptor 
-    - CCCD
-    - 16-bit UUID
-    - Read / Write 
 
-4. GPS Characteristics
-- 13-byte payload:
-    - timestamp
-    - lat
-    - long
-    - fix_valid: Validation flag
-- Gets initated with invalid 0 data
-- Is based on a notification subscription when new GPS fixes are avaliable. 
 
-5. CCCD Handling: 
-- Tracks client notif. subs. 
-- 
+
+## Overview
+Running on the Adafruit ESP32 Feather V2, these files contain the firmware used to control the MotoVis Jacket electronics for the current working prototype. The ESP32 acts as the central microcontroller for the jacket, collecting data from the connected sensors, packaging that data into structured binary packets, and making those packets available to the MotoVis Android companion app over Bluetooth Low Energy (BLE).
+
+The firmware establishes a custom BLE General Attribute Profile (GATT) service, where the ESP32 operates as the BLE server and the Android phone operates as the BLE client. Within this custom service, each major sensor system is exposed through its own characteristic, allowing the companion app to independently read or subscribe to updates from the GNSS module, accelerometer, heart sensor, and battery monitor.
+
+The GNSS module provides live GPS location data, which is packaged as latitude and longitude values for the Android app to decode and display. The ADXL345 accelerometer provides calibrated motion data and crash-evidence alert flags that the app uses as the starting point for crash validation. The PulseSensor Amped provides heart-rate-related data for rider monitoring, while the battery monitoring firmware reports the jacket’s battery voltage so the app can display power status.
+
+The firmware is organized into separate components so each subsystem can be developed, tested, and maintained independently. Sensor managers handle the low-level hardware communication, while the main BLE firmware file is responsible for building the GATT service, publishing sensor packets, handling client connections, and managing jacket controls such as buttons, LEDs, pairing behavior, and temporary sleep behavior.
+
+
+## Hardware
+- Adafruit EPS32 Feather V2
+- ADXL345 Accelerometer
+- PulseSensor Amped
+- SparkFun GNSS Max-M10S
+- GNSS Active Antena
+
